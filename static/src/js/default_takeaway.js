@@ -1,10 +1,7 @@
 /** @odoo-module **/
 
 import { patch } from "@web/core/utils/patch";
-
-// Import “robusto”: a veces Order no viene como export nombrado.
 import * as posStoreMod from "@point_of_sale/app/store/pos_store";
-import * as models from "@point_of_sale/app/store/models";
 
 const TARGET_POS_NAME = "Piso 1";
 const DEBUG = true;
@@ -12,27 +9,15 @@ const DEBUG = true;
 function log(...a) {
     if (DEBUG) console.log("[pos_piso1_default_takeaway]", ...a);
 }
+function warn(...a) {
+    console.warn("[pos_piso1_default_takeaway]", ...a);
+}
 
 const PosStore = posStoreMod.PosStore || posStoreMod.default;
-const Order =
-    models.Order ||
-    models.PosOrder ||
-    models.OrderModel ||
-    models.PosOrderModel;
-
-if (!PosStore) {
-    console.error("[pos_piso1_default_takeaway] ❌ PosStore undefined. Revisa import path.");
-}
-if (!Order) {
-    console.error(
-        "[pos_piso1_default_takeaway] ❌ Order undefined. exports disponibles en models:",
-        Object.keys(models)
-    );
-}
 
 function isPiso1(pos) {
-    const name = pos?.config?.name || "";
-    return name.trim().toLowerCase() === TARGET_POS_NAME.toLowerCase();
+    const name = pos?.config?.name;
+    return !!name && name.trim().toLowerCase() === TARGET_POS_NAME.toLowerCase();
 }
 
 function getTakeawayFiscalPosition(pos) {
@@ -44,132 +29,148 @@ function getTakeawayFiscalPosition(pos) {
     );
 }
 
-function isOrderTakeaway(order) {
+function safeRecompute(order) {
     try {
-        if (typeof order.get_is_takeaway === "function") return !!order.get_is_takeaway();
-        if (typeof order.getIsTakeaway === "function") return !!order.getIsTakeaway();
-        return order.is_takeaway === true || order.isTakeaway === true;
-    } catch {
-        return false;
+        if (!order) return;
+        if (typeof order.recomputeTaxes === "function") order.recomputeTaxes();
+        else if (typeof order.recompute_tax === "function") order.recompute_tax();
+        else if (typeof order._recomputeTaxes === "function") order._recomputeTaxes();
+        if (typeof order.trigger === "function") order.trigger("change", order);
+    } catch (e) {
+        warn("No pude recomputar impuestos:", e);
+    }
+}
+
+function setTakeawayFlag(order, val = true) {
+    try {
+        if (!order) return;
+        if (typeof order.set_is_takeaway === "function") order.set_is_takeaway(val);
+        else if (typeof order.setIsTakeaway === "function") order.setIsTakeaway(val);
+        else {
+            order.is_takeaway = !!val;
+            order.isTakeaway = !!val;
+        }
+    } catch (e) {
+        warn("No pude setear takeaway flag:", e);
+    }
+}
+
+function setFiscalPosition(order, fpos) {
+    try {
+        if (!order || !fpos) return;
+        if (typeof order.set_fiscal_position === "function") order.set_fiscal_position(fpos);
+        else if (typeof order.setFiscalPosition === "function") order.setFiscalPosition(fpos);
+        else {
+            order.fiscal_position = fpos;
+            order.fiscalPosition = fpos;
+        }
+    } catch (e) {
+        warn("No pude setear fiscal position:", e);
     }
 }
 
 function forceTakeaway(pos, order) {
     if (!pos || !order) return;
-
-    // bandera takeaway
-    try {
-        if (typeof order.set_is_takeaway === "function") order.set_is_takeaway(true);
-        else if (typeof order.setIsTakeaway === "function") order.setIsTakeaway(true);
-        else {
-            order.is_takeaway = true;
-            order.isTakeaway = true;
-        }
-    } catch (e) {
-        log("No pude setear takeaway flag:", e);
-    }
-
-    // fiscal position takeaway
-    const fpos = getTakeawayFiscalPosition(pos);
-    if (fpos) {
-        try {
-            if (typeof order.set_fiscal_position === "function") order.set_fiscal_position(fpos);
-            else if (typeof order.setFiscalPosition === "function") order.setFiscalPosition(fpos);
-            else {
-                order.fiscal_position = fpos;
-                order.fiscalPosition = fpos;
-            }
-        } catch (e) {
-            log("No pude setear fiscal position:", e);
-        }
-    } else {
-        log("WARNING: No existe takeaway fiscal position en config del POS.");
-    }
-
-    // recompute taxes
-    try {
-        if (typeof order.recomputeTaxes === "function") order.recomputeTaxes();
-        else if (typeof order.recompute_tax === "function") order.recompute_tax();
-        else if (typeof order._recomputeTaxes === "function") order._recomputeTaxes();
-
-        if (typeof order.trigger === "function") order.trigger("change", order);
-    } catch (e) {
-        log("No pude recomputar impuestos:", e);
-    }
-
-    log("✅ forceTakeaway aplicado. fpos:", fpos);
-}
-
-function applyDefaultIfNeeded(pos, order) {
     if (!isPiso1(pos)) return;
-    if (!order) return;
-    if (isOrderTakeaway(order)) return;
-    forceTakeaway(pos, order);
+
+    const fpos = getTakeawayFiscalPosition(pos);
+    setTakeawayFlag(order, true);
+    if (fpos) setFiscalPosition(order, fpos);
+
+    // Recompute en 2 fases para evitar carreras del POS (muy típico al setear cliente)
+    queueMicrotask(() => safeRecompute(order));
+    setTimeout(() => safeRecompute(order), 50);
+
+    log("✅ forceTakeaway aplicado. fpos:", fpos || "(none)");
 }
 
 /**
- * PATCHES (solo si existen las clases)
+ * Monkeypatch por ORDEN (instancia) para arreglar el bug del cliente:
+ * cuando set_partner corre, Odoo puede recalcular fiscal position => te re-mete el 10%.
+ * Entonces después de set_partner, re-forzamos takeaway.
  */
-if (PosStore) {
+function hookPartnerSetter(pos, order) {
+    if (!pos || !order) return;
+    if (!isPiso1(pos)) return;
+
+    // Evita parchear 500 veces la misma orden
+    if (order.__piso1_takeaway_hooked) return;
+    order.__piso1_takeaway_hooked = true;
+
+    const orig_set_partner = order.set_partner?.bind(order);
+    const orig_setPartner = order.setPartner?.bind(order);
+
+    if (orig_set_partner) {
+        order.set_partner = function (partner) {
+            const res = orig_set_partner(partner);
+            // después de asignar cliente, re-aplicamos takeaway sí o sí
+            queueMicrotask(() => forceTakeaway(pos, order));
+            setTimeout(() => forceTakeaway(pos, order), 80);
+            return res;
+        };
+        log("hook set_partner ✅");
+        return;
+    }
+
+    if (orig_setPartner) {
+        order.setPartner = function (partner) {
+            const res = orig_setPartner(partner);
+            queueMicrotask(() => forceTakeaway(pos, order));
+            setTimeout(() => forceTakeaway(pos, order), 80);
+            return res;
+        };
+        log("hook setPartner ✅");
+        return;
+    }
+
+    warn("No encontré set_partner/setPartner en la orden (raro).");
+}
+
+function applyToCurrentOrder(pos) {
+    if (!pos) return;
+    if (!isPiso1(pos)) return;
+
+    const order = pos.get_order?.() || pos.getOrder?.();
+    if (!order) return;
+
+    // primero engancha set_partner para que NO se te rompa al poner cliente
+    hookPartnerSetter(pos, order);
+
+    // luego forzá takeaway
+    forceTakeaway(pos, order);
+}
+
+if (!PosStore) {
+    console.error("[pos_piso1_default_takeaway] ❌ PosStore undefined. Revisa import path.");
+} else {
     patch(PosStore.prototype, {
         setup() {
             super.setup(...arguments);
 
-            queueMicrotask(() => {
-                const order = this.get_order?.() || this.getOrder?.();
-                applyDefaultIfNeeded(this, order);
-            });
-
+            // MUY importante: esperar un toque para no matar Owl por nulls en la UI
             setTimeout(() => {
-                const order = this.get_order?.() || this.getOrder?.();
-                applyDefaultIfNeeded(this, order);
-            }, 50);
-
-            log("PosStore patched ✅ POS:", this.config?.name);
+                try {
+                    if (!this?.config?.name) return; // aún no listo
+                    applyToCurrentOrder(this);
+                    log("PosStore patched ✅ POS:", this.config?.name);
+                } catch (e) {
+                    console.error("[pos_piso1_default_takeaway] setup crash:", e);
+                }
+            }, 250);
         },
 
         add_new_order() {
             const res = super.add_new_order(...arguments);
-            const order = this.get_order?.() || this.getOrder?.();
-            applyDefaultIfNeeded(this, order);
+            setTimeout(() => applyToCurrentOrder(this), 0);
             return res;
         },
 
         set_order(order) {
             const res = super.set_order?.(...arguments);
-            applyDefaultIfNeeded(this, order);
+            setTimeout(() => applyToCurrentOrder(this), 0);
             return res;
         },
     });
+
+    log("loaded ✅");
 }
-
-if (Order) {
-    patch(Order.prototype, {
-        set_partner(partner) {
-            const res = super.set_partner(...arguments);
-
-            const pos = this.pos || null;
-            if (!pos || !isPiso1(pos)) return res;
-
-            // El partner te cambia fiscal position => re-aplicamos takeaway
-            queueMicrotask(() => forceTakeaway(pos, this));
-            setTimeout(() => forceTakeaway(pos, this), 50);
-
-            return res;
-        },
-
-        setPartner(partner) {
-            const res = super.setPartner?.(...arguments);
-
-            const pos = this.pos || null;
-            if (!pos || !isPiso1(pos)) return res;
-
-            queueMicrotask(() => forceTakeaway(pos, this));
-            setTimeout(() => forceTakeaway(pos, this), 50);
-
-            return res;
-        },
-    });
-}
-
-log("loaded ✅");
