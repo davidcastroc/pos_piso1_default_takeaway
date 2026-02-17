@@ -1,211 +1,218 @@
 /** @odoo-module **/
 
 import { patch } from "@web/core/utils/patch";
-import * as posStoreMod from "@point_of_sale/app/store/pos_store";
-import * as modelsMod from "@point_of_sale/app/store/models";
+import { PosStore } from "@point_of_sale/app/store/pos_store";
+import { Order } from "@point_of_sale/app/store/models";
 
-const PosStore = posStoreMod.PosStore || posStoreMod.default;
-const Order = modelsMod.Order || modelsMod.default?.Order;
+/**
+ * CONFIG
+ * Cambiá SOLO esto si algún día renombrás el POS
+ */
+const TARGET_POS_NAME = "Piso 1";
 
-const POS_PISO1_CONFIG_ID = 1; // <-- CAMBIAR al ID real del PdV Piso 1
+// ponelo en false si ya no querés spam en consola
+const DEBUG = true;
+
+/**
+ * Helpers
+ */
+function log(...args) {
+    if (DEBUG) console.log("[pos_piso1_default_takeaway]", ...args);
+}
 
 function isPiso1(pos) {
-    return pos?.config?.id === POS_PISO1_CONFIG_ID;
-}
-
-function getTakeawayFpId(pos) {
-    const c = pos?.config || {};
-    const val =
-        c.takeaway_fiscal_position_id ??
-        c.takeaway_fp_id ??
-        c.fiscal_position_takeaway_id ??
-        c.takeaway_fpos_id ??
-        null;
-
-    if (Array.isArray(val)) return val[0];
-    return val || null;
-}
-
-function getFpObj(pos, fpId) {
-    if (!fpId) return null;
-    if (pos?.fiscal_positions_by_id?.[fpId]) return pos.fiscal_positions_by_id[fpId];
-    if (Array.isArray(pos?.fiscal_positions)) {
-        return pos.fiscal_positions.find((x) => x.id === fpId) || null;
-    }
-    return null;
-}
-
-function markTakeaway(order) {
-    if (typeof order.set_takeaway === "function") return order.set_takeaway(true);
-    if (typeof order.set_is_takeaway === "function") return order.set_is_takeaway(true);
-    if (typeof order.setTakeaway === "function") return order.setTakeaway(true);
-    order.is_takeaway = true;
-    order.takeaway = true;
-}
-
-function isOrderTakeaway(order) {
-    return !!(order?.is_takeaway || order?.takeaway);
-}
-
-function setOrderFiscalPosition(order, fpId, fpObj) {
-    if (!fpId) return;
-    if (typeof order.set_fiscal_position === "function") {
-        order.set_fiscal_position(fpObj || fpId);
-        return;
-    }
-    if (typeof order.setFiscalPosition === "function") {
-        order.setFiscalPosition(fpObj || fpId);
-        return;
-    }
-    order.fiscal_position_id = fpId;
-    order.fiscal_position = fpObj || fpId;
-}
-
-function recomputeOrderTaxes(order) {
-    if (typeof order._applyFiscalPosition === "function") order._applyFiscalPosition();
-    if (typeof order._recomputeTaxes === "function") order._recomputeTaxes();
-    if (typeof order.compute_all_changes === "function") order.compute_all_changes();
-    if (typeof order._computeTax === "function") order._computeTax();
-    if (typeof order.trigger === "function") order.trigger("change", order);
-}
-
-// 🔥 la función clave
-function forceTakeawayOnOrder(pos, order) {
-    if (!pos || !order) return false;
-    if (!isPiso1(pos)) return false;
-
-    markTakeaway(order);
-
-    const fpId = getTakeawayFpId(pos);
-    const fpObj = getFpObj(pos, fpId);
-
-    if (fpId) {
-        // aplicar FP + recalcular
-        setOrderFiscalPosition(order, fpId, fpObj);
-        recomputeOrderTaxes(order);
-    }
-
-    return true;
+    const name = pos?.config?.name || "";
+    return name.trim().toLowerCase() === TARGET_POS_NAME.toLowerCase();
 }
 
 /**
- * 1) Default takeaway al crear/cambiar orden
+ * Encuentra fiscal position "takeaway" desde el POS config.
+ * En tu caso, es la que usás en: "Comer en el local/para llevar"
+ * (la que mapea 10% -> 13% y quita el 10%).
  */
-if (PosStore) {
-    patch(PosStore.prototype, {
-        add_new_order() {
-            const order = super.add_new_order(...arguments);
-            try {
-                setTimeout(() => forceTakeawayOnOrder(this, order), 0);
-                setTimeout(() => forceTakeawayOnOrder(this, order), 300);
-            } catch (e) {
-                console.warn("⚠️ Piso1 add_new_order error", e);
-            }
-            return order;
-        },
-
-        set_order(order) {
-            const res = super.set_order(...arguments);
-            try {
-                setTimeout(() => forceTakeawayOnOrder(this, order), 0);
-                setTimeout(() => forceTakeawayOnOrder(this, order), 300);
-            } catch (e) {
-                console.warn("⚠️ Piso1 set_order error", e);
-            }
-            return res;
-        },
-    });
+function getTakeawayFiscalPosition(pos) {
+    // Odoo suele guardar acá la fiscal position usada para takeaway
+    // (puede variar según build, por eso chequeamos varias)
+    return (
+        pos?.config?.takeaway_fiscal_position_id ||
+        pos?.config?.takeawayFiscalPositionId ||
+        pos?.config?.takeaway_fiscal_position ||
+        null
+    );
 }
 
 /**
- * 2) GUARD: si Odoo intenta cambiar fiscal position (por cliente), lo corregimos.
- *    Esto es lo que te está jodiendo ahorita.
+ * Marca la orden como takeaway en el modelo y fuerza fiscal position + taxes recompute.
+ * IMPORTANTE: el botón puede decir takeaway pero si no seteás fpos y no recalculás,
+ * te queda igual (ese era tu síntoma).
  */
-if (Order) {
-    // A) cuando inicia la orden
-    patch(Order.prototype, {
-        setup() {
-            super.setup(...arguments);
-            try {
-                if (isPiso1(this.pos)) {
-                    setTimeout(() => forceTakeawayOnOrder(this.pos, this), 50);
-                    setTimeout(() => forceTakeawayOnOrder(this.pos, this), 350);
-                }
-            } catch (e) {
-                console.warn("⚠️ Piso1 Order.setup error", e);
-            }
-        },
-    });
+function forceTakeaway(pos, order) {
+    if (!pos || !order) return;
 
-    // B) cuando asignás partner (cliente): lo forzamos DESPUÉS (varias veces)
-    patch(Order.prototype, {
-        set_partner(partner) {
-            const res = super.set_partner?.(...arguments);
-            try {
-                if (isPiso1(this.pos)) {
-                    setTimeout(() => forceTakeawayOnOrder(this.pos, this), 0);
-                    setTimeout(() => forceTakeawayOnOrder(this.pos, this), 250);
-                    setTimeout(() => forceTakeawayOnOrder(this.pos, this), 800);
-                }
-            } catch (e) {
-                console.warn("⚠️ Piso1 set_partner error", e);
-            }
-            return res;
-        },
+    // 1) bandera de takeaway (según build puede existir una u otra)
+    try {
+        if (typeof order.set_is_takeaway === "function") {
+            order.set_is_takeaway(true);
+        } else if (typeof order.setIsTakeaway === "function") {
+            order.setIsTakeaway(true);
+        } else {
+            // fallback: propiedad directa (algunas builds)
+            order.is_takeaway = true;
+            order.isTakeaway = true;
+        }
+    } catch (e) {
+        log("No pude setear bandera takeaway:", e);
+    }
 
-        setPartner(partner) {
-            const res = super.setPartner?.(...arguments);
-            try {
-                if (isPiso1(this.pos)) {
-                    setTimeout(() => forceTakeawayOnOrder(this.pos, this), 0);
-                    setTimeout(() => forceTakeawayOnOrder(this.pos, this), 250);
-                    setTimeout(() => forceTakeawayOnOrder(this.pos, this), 800);
-                }
-            } catch (e) {
-                console.warn("⚠️ Piso1 setPartner error", e);
+    // 2) fiscal position de takeaway
+    const fpos = getTakeawayFiscalPosition(pos);
+    if (fpos) {
+        try {
+            if (typeof order.set_fiscal_position === "function") {
+                order.set_fiscal_position(fpos);
+            } else if (typeof order.setFiscalPosition === "function") {
+                order.setFiscalPosition(fpos);
+            } else {
+                // fallback: directo
+                order.fiscal_position = fpos;
+                order.fiscalPosition = fpos;
             }
-            return res;
-        },
-    });
+        } catch (e) {
+            log("No pude setear fiscal position takeaway:", e);
+        }
+    } else {
+        // Si no existe en config, igual dejamos la bandera takeaway; pero lo normal es que sí exista.
+        log("WARNING: No encontré takeaway fiscal position en config (revisar POS settings).");
+    }
 
-    // C) EL VERDADERO “CINTURÓN DE SEGURIDAD”:
-    //    cada vez que Odoo cambie fiscal position, si es Piso1 => lo devolvemos a TAKEAWAY.
-    patch(Order.prototype, {
-        set_fiscal_position(fp) {
-            const res = super.set_fiscal_position?.(...arguments);
-            try {
-                if (isPiso1(this.pos)) {
-                    // si ya debería ser takeaway, forzarlo
-                    if (isOrderTakeaway(this)) {
-                        setTimeout(() => forceTakeawayOnOrder(this.pos, this), 0);
-                        setTimeout(() => forceTakeawayOnOrder(this.pos, this), 200);
-                    }
-                }
-            } catch (e) {
-                console.warn("⚠️ Piso1 set_fiscal_position guard error", e);
-            }
-            return res;
-        },
+    // 3) forzar recompute de impuestos (varía por build)
+    try {
+        // Hay builds donde existe recomputeTax / recomputeTaxes
+        if (typeof order.recomputeTaxes === "function") {
+            order.recomputeTaxes();
+        } else if (typeof order.recompute_tax === "function") {
+            order.recompute_tax();
+        } else if (typeof order._recomputeTaxes === "function") {
+            order._recomputeTaxes();
+        }
 
-        setFiscalPosition(fp) {
-            const res = super.setFiscalPosition?.(...arguments);
-            try {
-                if (isPiso1(this.pos)) {
-                    if (isOrderTakeaway(this)) {
-                        setTimeout(() => forceTakeawayOnOrder(this.pos, this), 0);
-                        setTimeout(() => forceTakeawayOnOrder(this.pos, this), 200);
-                    }
-                }
-            } catch (e) {
-                console.warn("⚠️ Piso1 setFiscalPosition guard error", e);
-            }
-            return res;
-        },
-    });
+        // Re-render / notify changes si existe
+        if (typeof order.trigger === "function") {
+            order.trigger("change", order);
+        }
+    } catch (e) {
+        log("No pude recomputar impuestos:", e);
+    }
+
+    log("forceTakeaway aplicado. fpos:", fpos);
 }
 
-console.log("✅ pos_piso1_default_takeaway loaded", {
-    PosStore: !!PosStore,
-    Order: !!Order,
-    POS_PISO1_CONFIG_ID,
+/**
+ * Aplica el default takeaway SOLO en Piso 1
+ * y SOLO si la orden todavía no está takeaway (evita loops).
+ */
+function applyDefaultIfNeeded(pos, order) {
+    if (!isPiso1(pos)) return;
+    if (!order) return;
+
+    const already =
+        order.is_takeaway === true ||
+        order.isTakeaway === true ||
+        (typeof order.get_is_takeaway === "function" && order.get_is_takeaway()) ||
+        (typeof order.getIsTakeaway === "function" && order.getIsTakeaway());
+
+    if (already) return;
+
+    forceTakeaway(pos, order);
+}
+
+/**
+ * PATCH PosStore:
+ * - Cuando carga POS
+ * - Cuando crea orden nueva
+ * - Cuando cambia orden seleccionada
+ */
+patch(PosStore.prototype, {
+    setup() {
+        super.setup(...arguments);
+
+        try {
+            // Al terminar de cargar y existir una orden
+            queueMicrotask(() => {
+                const order = this.get_order?.() || this.getOrder?.();
+                applyDefaultIfNeeded(this, order);
+            });
+
+            // Por si termina de cargar algo async
+            setTimeout(() => {
+                const order = this.get_order?.() || this.getOrder?.();
+                applyDefaultIfNeeded(this, order);
+            }, 50);
+
+            log("PosStore patched OK. POS:", this.config?.name);
+        } catch (e) {
+            log("Error en PosStore.setup:", e);
+        }
+    },
+
+    add_new_order() {
+        const res = super.add_new_order(...arguments);
+        const order = this.get_order?.() || this.getOrder?.();
+        applyDefaultIfNeeded(this, order);
+        return res;
+    },
+
+    // En algunas builds se llama create_new_order
+    create_new_order() {
+        const res = super.create_new_order?.(...arguments);
+        const order = this.get_order?.() || this.getOrder?.();
+        applyDefaultIfNeeded(this, order);
+        return res;
+    },
+
+    set_order(order) {
+        const res = super.set_order?.(...arguments);
+        applyDefaultIfNeeded(this, order);
+        return res;
+    },
 });
+
+/**
+ * PATCH Order:
+ * Cuando agregás cliente, Odoo reaplica fiscal position del partner.
+ * Entonces re-aplicamos takeaway DESPUÉS de set_partner.
+ */
+patch(Order.prototype, {
+    set_partner(partner) {
+        const res = super.set_partner(...arguments);
+
+        const pos = this.pos || null;
+        if (!pos || !isPiso1(pos)) return res;
+
+        const reapply = () => forceTakeaway(pos, this);
+
+        // Inmediato (después del set_partner)
+        queueMicrotask(reapply);
+
+        // Por si el recompute viene async
+        setTimeout(reapply, 50);
+
+        return res;
+    },
+
+    // Algunas builds usan setPartner
+    setPartner(partner) {
+        const res = super.setPartner?.(...arguments);
+
+        const pos = this.pos || null;
+        if (!pos || !isPiso1(pos)) return res;
+
+        const reapply = () => forceTakeaway(pos, this);
+        queueMicrotask(reapply);
+        setTimeout(reapply, 50);
+
+        return res;
+    },
+});
+
+log("loaded ✅");
