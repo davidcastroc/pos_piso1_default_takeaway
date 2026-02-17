@@ -1,176 +1,177 @@
 /** @odoo-module **/
 
 import { patch } from "@web/core/utils/patch";
+
+// ✅ IMPORTS “a prueba de builds”
 import * as posStoreMod from "@point_of_sale/app/store/pos_store";
-
-const TARGET_POS_NAME = "Piso 1";
-const DEBUG = true;
-
-function log(...a) {
-    if (DEBUG) console.log("[pos_piso1_default_takeaway]", ...a);
-}
-function warn(...a) {
-    console.warn("[pos_piso1_default_takeaway]", ...a);
-}
+import * as modelsMod from "@point_of_sale/app/store/models";
 
 const PosStore = posStoreMod.PosStore || posStoreMod.default;
+const Order = modelsMod.Order || modelsMod.default?.Order;
+
+// ✅ CAMBIÁ ESTO si tu Piso 1 tiene otro config_id
+const POS_PISO1_CONFIG_ID = 1;
 
 function isPiso1(pos) {
-    const name = pos?.config?.name;
-    return !!name && name.trim().toLowerCase() === TARGET_POS_NAME.toLowerCase();
+    return pos?.config?.id === POS_PISO1_CONFIG_ID;
 }
 
-function getTakeawayFiscalPosition(pos) {
-    return (
-        pos?.config?.takeaway_fiscal_position_id ||
-        pos?.config?.takeawayFiscalPositionId ||
-        pos?.config?.takeaway_fiscal_position ||
-        null
-    );
+function getTakeawayFpId(pos) {
+    const c = pos?.config || {};
+    const val =
+        c.takeaway_fiscal_position_id ??
+        c.takeaway_fp_id ??
+        c.fiscal_position_takeaway_id ??
+        c.takeaway_fpos_id ??
+        null;
+
+    if (Array.isArray(val)) return val[0];
+    return val || null;
 }
 
-function safeRecompute(order) {
-    try {
-        if (!order) return;
-        if (typeof order.recomputeTaxes === "function") order.recomputeTaxes();
-        else if (typeof order.recompute_tax === "function") order.recompute_tax();
-        else if (typeof order._recomputeTaxes === "function") order._recomputeTaxes();
-        if (typeof order.trigger === "function") order.trigger("change", order);
-    } catch (e) {
-        warn("No pude recomputar impuestos:", e);
+function getFpObj(pos, fpId) {
+    if (!fpId) return null;
+    if (pos?.fiscal_positions_by_id?.[fpId]) return pos.fiscal_positions_by_id[fpId];
+    if (Array.isArray(pos?.fiscal_positions)) {
+        return pos.fiscal_positions.find((x) => x.id === fpId) || null;
     }
+    return null;
 }
 
-function setTakeawayFlag(order, val = true) {
-    try {
-        if (!order) return;
-        if (typeof order.set_is_takeaway === "function") order.set_is_takeaway(val);
-        else if (typeof order.setIsTakeaway === "function") order.setIsTakeaway(val);
-        else {
-            order.is_takeaway = !!val;
-            order.isTakeaway = !!val;
-        }
-    } catch (e) {
-        warn("No pude setear takeaway flag:", e);
-    }
-}
-
-function setFiscalPosition(order, fpos) {
-    try {
-        if (!order || !fpos) return;
-        if (typeof order.set_fiscal_position === "function") order.set_fiscal_position(fpos);
-        else if (typeof order.setFiscalPosition === "function") order.setFiscalPosition(fpos);
-        else {
-            order.fiscal_position = fpos;
-            order.fiscalPosition = fpos;
-        }
-    } catch (e) {
-        warn("No pude setear fiscal position:", e);
-    }
-}
-
-function forceTakeaway(pos, order) {
-    if (!pos || !order) return;
-    if (!isPiso1(pos)) return;
-
-    const fpos = getTakeawayFiscalPosition(pos);
-    setTakeawayFlag(order, true);
-    if (fpos) setFiscalPosition(order, fpos);
-
-    // Recompute en 2 fases para evitar carreras del POS (muy típico al setear cliente)
-    queueMicrotask(() => safeRecompute(order));
-    setTimeout(() => safeRecompute(order), 50);
-
-    log("✅ forceTakeaway aplicado. fpos:", fpos || "(none)");
-}
-
-/**
- * Monkeypatch por ORDEN (instancia) para arreglar el bug del cliente:
- * cuando set_partner corre, Odoo puede recalcular fiscal position => te re-mete el 10%.
- * Entonces después de set_partner, re-forzamos takeaway.
- */
-function hookPartnerSetter(pos, order) {
-    if (!pos || !order) return;
-    if (!isPiso1(pos)) return;
-
-    // Evita parchear 500 veces la misma orden
-    if (order.__piso1_takeaway_hooked) return;
-    order.__piso1_takeaway_hooked = true;
-
-    const orig_set_partner = order.set_partner?.bind(order);
-    const orig_setPartner = order.setPartner?.bind(order);
-
-    if (orig_set_partner) {
-        order.set_partner = function (partner) {
-            const res = orig_set_partner(partner);
-            // después de asignar cliente, re-aplicamos takeaway sí o sí
-            queueMicrotask(() => forceTakeaway(pos, order));
-            setTimeout(() => forceTakeaway(pos, order), 80);
-            return res;
-        };
-        log("hook set_partner ✅");
+function setOrderFiscalPosition(order, fpId, fpObj) {
+    if (typeof order.set_fiscal_position === "function") {
+        order.set_fiscal_position(fpObj || fpId);
         return;
     }
-
-    if (orig_setPartner) {
-        order.setPartner = function (partner) {
-            const res = orig_setPartner(partner);
-            queueMicrotask(() => forceTakeaway(pos, order));
-            setTimeout(() => forceTakeaway(pos, order), 80);
-            return res;
-        };
-        log("hook setPartner ✅");
+    if (typeof order.setFiscalPosition === "function") {
+        order.setFiscalPosition(fpObj || fpId);
         return;
     }
-
-    warn("No encontré set_partner/setPartner en la orden (raro).");
+    order.fiscal_position_id = fpId;
+    order.fiscal_position = fpObj || fpId;
 }
 
-function applyToCurrentOrder(pos) {
-    if (!pos) return;
-    if (!isPiso1(pos)) return;
+function recomputeOrderTaxes(order) {
+    if (typeof order._applyFiscalPosition === "function") order._applyFiscalPosition();
+    if (typeof order._recomputeTaxes === "function") order._recomputeTaxes();
+    if (typeof order.compute_all_changes === "function") order.compute_all_changes();
+    if (typeof order._computeTax === "function") order._computeTax();
 
-    const order = pos.get_order?.() || pos.getOrder?.();
-    if (!order) return;
-
-    // primero engancha set_partner para que NO se te rompa al poner cliente
-    hookPartnerSetter(pos, order);
-
-    // luego forzá takeaway
-    forceTakeaway(pos, order);
+    if (typeof order.trigger === "function") order.trigger("change", order);
 }
 
-if (!PosStore) {
-    console.error("[pos_piso1_default_takeaway] ❌ PosStore undefined. Revisa import path.");
-} else {
+function forceTakeawayOnOrder(pos, order) {
+    if (!pos || !order) return false;
+    if (!isPiso1(pos)) return false;
+
+    // 1) marcar takeaway (estado)
+    if (typeof order.set_takeaway === "function") order.set_takeaway(true);
+    else if (typeof order.set_is_takeaway === "function") order.set_is_takeaway(true);
+    else if (typeof order.setTakeaway === "function") order.setTakeaway(true);
+    else {
+        order.is_takeaway = true;
+        order.takeaway = true;
+    }
+
+    // 2) aplicar fiscal position de TAKEAWAY
+    const fpId = getTakeawayFpId(pos);
+    const fpObj = getFpObj(pos, fpId);
+
+    if (fpId) {
+        setOrderFiscalPosition(order, fpId, fpObj);
+        recomputeOrderTaxes(order);
+    }
+
+    console.log("✅ [Piso1 Default Takeaway] aplicado", {
+        order_uid: order.uid,
+        fpId,
+        fpName: fpObj?.name,
+        is_takeaway: order.is_takeaway ?? order.takeaway,
+    });
+
+    return true;
+}
+
+console.log("🔥 [pos_piso1_default_takeaway] cargado", { PosStore: !!PosStore, Order: !!Order });
+
+// ==========================
+// PATCH POS STORE
+// ==========================
+if (PosStore) {
     patch(PosStore.prototype, {
-        setup() {
-            super.setup(...arguments);
-
-            // MUY importante: esperar un toque para no matar Owl por nulls en la UI
-            setTimeout(() => {
-                try {
-                    if (!this?.config?.name) return; // aún no listo
-                    applyToCurrentOrder(this);
-                    log("PosStore patched ✅ POS:", this.config?.name);
-                } catch (e) {
-                    console.error("[pos_piso1_default_takeaway] setup crash:", e);
-                }
-            }, 250);
-        },
-
         add_new_order() {
-            const res = super.add_new_order(...arguments);
-            setTimeout(() => applyToCurrentOrder(this), 0);
-            return res;
+            const order = super.add_new_order(...arguments);
+            try {
+                forceTakeawayOnOrder(this, order);
+            } catch (e) {
+                console.warn("⚠️ Piso1 add_new_order error", e);
+            }
+            return order;
         },
 
         set_order(order) {
-            const res = super.set_order?.(...arguments);
-            setTimeout(() => applyToCurrentOrder(this), 0);
+            const res = super.set_order(...arguments);
+            try {
+                forceTakeawayOnOrder(this, order);
+            } catch (e) {
+                console.warn("⚠️ Piso1 set_order error", e);
+            }
             return res;
         },
     });
+} else {
+    console.warn("⚠️ PosStore no existe en este build. No se pudo parchar store.");
+}
 
-    log("loaded ✅");
+// ==========================
+// PATCH ORDER
+// ==========================
+if (Order) {
+    patch(Order.prototype, {
+        setup() {
+            super.setup(...arguments);
+            try {
+                const pos = this.pos;
+                if (isPiso1(pos)) {
+                    setTimeout(() => {
+                        forceTakeawayOnOrder(pos, this);
+                    }, 50);
+                }
+            } catch (e) {
+                console.warn("⚠️ Piso1 Order.setup error", e);
+            }
+        },
+
+        // 🔥 FIX CUANDO SE AGREGA CLIENTE
+        set_partner(partner) {
+            const res = super.set_partner?.(...arguments);
+            try {
+                const pos = this.pos;
+                if (isPiso1(pos)) {
+                    queueMicrotask(() => forceTakeawayOnOrder(pos, this));
+                    setTimeout(() => forceTakeawayOnOrder(pos, this), 60);
+                }
+            } catch (e) {
+                console.warn("⚠️ Piso1 set_partner error", e);
+            }
+            return res;
+        },
+
+        // Fallback builds raros
+        setPartner(partner) {
+            const res = super.setPartner?.(...arguments);
+            try {
+                const pos = this.pos;
+                if (isPiso1(pos)) {
+                    queueMicrotask(() => forceTakeawayOnOrder(pos, this));
+                    setTimeout(() => forceTakeawayOnOrder(pos, this), 60);
+                }
+            } catch (e) {
+                console.warn("⚠️ Piso1 setPartner error", e);
+            }
+            return res;
+        },
+    });
+} else {
+    console.warn("⚠️ Order no existe en este build. No se pudo parchar Order.");
 }
