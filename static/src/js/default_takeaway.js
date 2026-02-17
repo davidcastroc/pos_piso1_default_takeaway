@@ -2,14 +2,14 @@
 
 import { patch } from "@web/core/utils/patch";
 
-// ✅ IMPORTS “a prueba de builds”
+// IMPORTS “a prueba de builds”
 import * as posStoreMod from "@point_of_sale/app/store/pos_store";
 import * as modelsMod from "@point_of_sale/app/store/models";
 
 const PosStore = posStoreMod.PosStore || posStoreMod.default;
 const Order = modelsMod.Order || modelsMod.default?.Order;
 
-// ✅ CAMBIÁ ESTO si tu Piso 1 tiene otro config_id
+// CAMBIÁ ESTO si tu Piso 1 tiene otro config_id
 const POS_PISO1_CONFIG_ID = 1;
 
 function isPiso1(pos) {
@@ -94,9 +94,9 @@ function forceTakeawayOnOrder(pos, order) {
 
 console.log("🔥 [pos_piso1_default_takeaway] cargado", { PosStore: !!PosStore, Order: !!Order });
 
-// ==========================
-// PATCH POS STORE
-// ==========================
+/* ==========================
+   PATCH POS STORE
+========================== */
 if (PosStore) {
     patch(PosStore.prototype, {
         add_new_order() {
@@ -119,13 +119,11 @@ if (PosStore) {
             return res;
         },
     });
-} else {
-    console.warn("⚠️ PosStore no existe en este build. No se pudo parchar store.");
 }
 
-// ==========================
-// PATCH ORDER
-// ==========================
+/* ==========================
+   PATCH ORDER
+========================== */
 if (Order) {
     patch(Order.prototype, {
         setup() {
@@ -142,14 +140,22 @@ if (Order) {
             }
         },
 
-        // 🔥 FIX CUANDO SE AGREGA CLIENTE
+        // 🔥 FIX DEFINITIVO CUANDO SE AGREGA CLIENTE
         set_partner(partner) {
             const res = super.set_partner?.(...arguments);
             try {
                 const pos = this.pos;
                 if (isPiso1(pos)) {
-                    queueMicrotask(() => forceTakeawayOnOrder(pos, this));
-                    setTimeout(() => forceTakeawayOnOrder(pos, this), 60);
+                    // Reaplicar varias veces porque Odoo recalcula async
+                    forceTakeawayOnOrder(pos, this);
+
+                    let tries = 0;
+                    const maxTries = 10;
+                    const interval = setInterval(() => {
+                        tries++;
+                        forceTakeawayOnOrder(pos, this);
+                        if (tries >= maxTries) clearInterval(interval);
+                    }, 100); // 1 segundo total
                 }
             } catch (e) {
                 console.warn("⚠️ Piso1 set_partner error", e);
@@ -157,14 +163,21 @@ if (Order) {
             return res;
         },
 
-        // Fallback builds raros
+        // fallback
         setPartner(partner) {
             const res = super.setPartner?.(...arguments);
             try {
                 const pos = this.pos;
                 if (isPiso1(pos)) {
-                    queueMicrotask(() => forceTakeawayOnOrder(pos, this));
-                    setTimeout(() => forceTakeawayOnOrder(pos, this), 60);
+                    forceTakeawayOnOrder(pos, this);
+
+                    let tries = 0;
+                    const maxTries = 10;
+                    const interval = setInterval(() => {
+                        tries++;
+                        forceTakeawayOnOrder(pos, this);
+                        if (tries >= maxTries) clearInterval(interval);
+                    }, 100);
                 }
             } catch (e) {
                 console.warn("⚠️ Piso1 setPartner error", e);
@@ -172,6 +185,4 @@ if (Order) {
             return res;
         },
     });
-} else {
-    console.warn("⚠️ Order no existe en este build. No se pudo parchar Order.");
 }
