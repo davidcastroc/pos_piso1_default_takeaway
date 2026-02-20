@@ -1,16 +1,12 @@
 /** @odoo-module **/
 
 import { patch } from "@web/core/utils/patch";
-
-// IMPORTS “a prueba de builds”
 import * as posStoreMod from "@point_of_sale/app/store/pos_store";
-import * as modelsMod from "@point_of_sale/app/store/models";
 
 const PosStore = posStoreMod.PosStore || posStoreMod.default;
-const Order = modelsMod.Order || modelsMod.default?.Order;
 
-// CAMBIÁ ESTO si tu Piso 1 tiene otro config_id
-const POS_PISO1_CONFIG_ID = 1;
+const POS_PISO1_CONFIG_ID = 1; // <-- CAMBIAR al ID real del PdV Piso 1
+const WRAP_FLAG = "__piso1_wrapped_set_partner__";
 
 function isPiso1(pos) {
     return pos?.config?.id === POS_PISO1_CONFIG_ID;
@@ -39,6 +35,8 @@ function getFpObj(pos, fpId) {
 }
 
 function setOrderFiscalPosition(order, fpId, fpObj) {
+    if (!fpId) return;
+
     if (typeof order.set_fiscal_position === "function") {
         order.set_fiscal_position(fpObj || fpId);
         return;
@@ -47,6 +45,7 @@ function setOrderFiscalPosition(order, fpId, fpObj) {
         order.setFiscalPosition(fpObj || fpId);
         return;
     }
+
     order.fiscal_position_id = fpId;
     order.fiscal_position = fpObj || fpId;
 }
@@ -56,31 +55,34 @@ function recomputeOrderTaxes(order) {
     if (typeof order._recomputeTaxes === "function") order._recomputeTaxes();
     if (typeof order.compute_all_changes === "function") order.compute_all_changes();
     if (typeof order._computeTax === "function") order._computeTax();
-
     if (typeof order.trigger === "function") order.trigger("change", order);
+}
+
+function markTakeaway(order) {
+    if (typeof order.set_takeaway === "function") return order.set_takeaway(true);
+    if (typeof order.set_is_takeaway === "function") return order.set_is_takeaway(true);
+    if (typeof order.setTakeaway === "function") return order.setTakeaway(true);
+    order.is_takeaway = true;
+    order.takeaway = true;
+}
+
+function isOrderTakeaway(order) {
+    return !!(order?.is_takeaway || order?.takeaway);
 }
 
 function forceTakeawayOnOrder(pos, order) {
     if (!pos || !order) return false;
     if (!isPiso1(pos)) return false;
 
-    // 1) marcar takeaway (estado)
-    if (typeof order.set_takeaway === "function") order.set_takeaway(true);
-    else if (typeof order.set_is_takeaway === "function") order.set_is_takeaway(true);
-    else if (typeof order.setTakeaway === "function") order.setTakeaway(true);
-    else {
-        order.is_takeaway = true;
-        order.takeaway = true;
-    }
+    markTakeaway(order);
 
-    // 2) aplicar fiscal position de TAKEAWAY
     const fpId = getTakeawayFpId(pos);
     const fpObj = getFpObj(pos, fpId);
 
     if (fpId) {
         setOrderFiscalPosition(order, fpId, fpObj);
-        recomputeOrderTaxes(order);
     }
+    recomputeOrderTaxes(order);
 
     console.log("✅ [Piso1 Default Takeaway] aplicado", {
         order_uid: order.uid,
@@ -92,17 +94,60 @@ function forceTakeawayOnOrder(pos, order) {
     return true;
 }
 
-console.log("🔥 [pos_piso1_default_takeaway] cargado", { PosStore: !!PosStore, Order: !!Order });
+/**
+ * 🔥 Este es el fix:
+ * Envolvemos set_partner / setPartner A NIVEL DE INSTANCIA.
+ * Así funciona aunque no exista modelsMod.Order.
+ */
+function wrapOrderPartnerSetter(pos, order) {
+    try {
+        if (!order || order[WRAP_FLAG]) return;
+        order[WRAP_FLAG] = true;
 
-/* ==========================
-   PATCH POS STORE
-========================== */
+        const wrap = (methodName) => {
+            if (typeof order[methodName] !== "function") return;
+
+            const original = order[methodName].bind(order);
+
+            order[methodName] = function (partner) {
+                const wasTakeaway = isOrderTakeaway(order);
+                const res = original(...arguments);
+
+                try {
+                    if (isPiso1(pos) && wasTakeaway && partner?.id) {
+                        // 👇 aquí es donde se arregla tu caso:
+                        // después de asignar cliente, re-forzamos takeaway+FP+taxis
+                        setTimeout(() => forceTakeawayOnOrder(pos, order), 0);
+                        setTimeout(() => forceTakeawayOnOrder(pos, order), 120);
+                        setTimeout(() => forceTakeawayOnOrder(pos, order), 350);
+                    }
+                } catch (e) {
+                    console.warn("⚠️ Piso1 wrapped set_partner error", e);
+                }
+
+                return res;
+            };
+        };
+
+        wrap("set_partner");
+        wrap("setPartner");
+
+        console.log("✅ Piso1: set_partner wrapped en instancia", { uid: order.uid });
+    } catch (e) {
+        console.warn("⚠️ wrapOrderPartnerSetter error", e);
+    }
+}
+
+console.log("🔥 [pos_piso1_default_takeaway] cargado", { PosStore: !!PosStore });
+
 if (PosStore) {
     patch(PosStore.prototype, {
         add_new_order() {
             const order = super.add_new_order(...arguments);
             try {
-                forceTakeawayOnOrder(this, order);
+                wrapOrderPartnerSetter(this, order);
+                setTimeout(() => forceTakeawayOnOrder(this, order), 0);
+                setTimeout(() => forceTakeawayOnOrder(this, order), 250);
             } catch (e) {
                 console.warn("⚠️ Piso1 add_new_order error", e);
             }
@@ -112,77 +157,15 @@ if (PosStore) {
         set_order(order) {
             const res = super.set_order(...arguments);
             try {
-                forceTakeawayOnOrder(this, order);
+                wrapOrderPartnerSetter(this, order);
+                setTimeout(() => forceTakeawayOnOrder(this, order), 0);
+                setTimeout(() => forceTakeawayOnOrder(this, order), 250);
             } catch (e) {
                 console.warn("⚠️ Piso1 set_order error", e);
             }
             return res;
         },
     });
-}
-
-/* ==========================
-   PATCH ORDER
-========================== */
-if (Order) {
-    patch(Order.prototype, {
-        setup() {
-            super.setup(...arguments);
-            try {
-                const pos = this.pos;
-                if (isPiso1(pos)) {
-                    setTimeout(() => {
-                        forceTakeawayOnOrder(pos, this);
-                    }, 50);
-                }
-            } catch (e) {
-                console.warn("⚠️ Piso1 Order.setup error", e);
-            }
-        },
-
-        // 🔥 FIX DEFINITIVO CUANDO SE AGREGA CLIENTE
-        set_partner(partner) {
-            const res = super.set_partner?.(...arguments);
-            try {
-                const pos = this.pos;
-                if (isPiso1(pos)) {
-                    // Reaplicar varias veces porque Odoo recalcula async
-                    forceTakeawayOnOrder(pos, this);
-
-                    let tries = 0;
-                    const maxTries = 10;
-                    const interval = setInterval(() => {
-                        tries++;
-                        forceTakeawayOnOrder(pos, this);
-                        if (tries >= maxTries) clearInterval(interval);
-                    }, 100); // 1 segundo total
-                }
-            } catch (e) {
-                console.warn("⚠️ Piso1 set_partner error", e);
-            }
-            return res;
-        },
-
-        // fallback
-        setPartner(partner) {
-            const res = super.setPartner?.(...arguments);
-            try {
-                const pos = this.pos;
-                if (isPiso1(pos)) {
-                    forceTakeawayOnOrder(pos, this);
-
-                    let tries = 0;
-                    const maxTries = 10;
-                    const interval = setInterval(() => {
-                        tries++;
-                        forceTakeawayOnOrder(pos, this);
-                        if (tries >= maxTries) clearInterval(interval);
-                    }, 100);
-                }
-            } catch (e) {
-                console.warn("⚠️ Piso1 setPartner error", e);
-            }
-            return res;
-        },
-    });
+} else {
+    console.warn("⚠️ PosStore no existe en este build. No se pudo parchar store.");
 }
